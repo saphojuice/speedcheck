@@ -57,7 +57,7 @@ best-of-three. Five consecutive runs agreed to within 2%.
 | Free memory under Windows | 3.4 GB of 15.4 GB reported |
 
 More threads do not help once the workload is waiting on memory: on this chip a single thread is
-the fastest configuration. The browser tier measures 23 GB/s on the same machine, because a
+the fastest configuration. On the reference machine the browser measures 23 GB/s where the command measures 34.6, because a
 WebAssembly `memory.copy` does not reach what a native STREAM triad does on one core.
 
 | Model | Predicted | Measured |
