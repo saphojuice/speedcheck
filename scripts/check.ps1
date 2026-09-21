@@ -14,7 +14,7 @@
 $ErrorActionPreference = 'Stop'
 
 $Repo    = 'saphojuice/speedcheck'
-$Version = if ($env:SJ_VERSION) { $env:SJ_VERSION } else { 'v0.1.0' }
+$Version = if ($env:SJ_VERSION) { $env:SJ_VERSION } else { 'v0.1.1' }
 $Base    = "https://github.com/$Repo/releases/download/$Version"
 
 function Die($msg) {

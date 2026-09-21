@@ -14,7 +14,7 @@
 set -eu
 
 REPO="saphojuice/speedcheck"
-VERSION="${SJ_VERSION:-v0.1.0}"
+VERSION="${SJ_VERSION:-v0.1.1}"
 BASE="https://github.com/${REPO}/releases/download/${VERSION}"
 
 die() {
