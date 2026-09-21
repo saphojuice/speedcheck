@@ -1431,9 +1431,9 @@ fn main() {
         return;
     }
     println!();
-    println!("Share this result with the SAPHOJUICE community? It helps everyone with your chip get a better answer.");
-    println!("Hardware and speed numbers only. No name, no account, nothing you type.");
-    println!("Published as anonymous aggregate data. [Y/n]");
+    println!("Share your results with the SAPHOJUICE community?");
+    println!("Hardware and speed numbers only, never personal info. [Y/n]");
+    println!("Terms: saphojuice.com/terms");
     print!("> ");
     let _ = std::io::stdout().flush();
     let mut answer = String::new();
