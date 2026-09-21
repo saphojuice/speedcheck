@@ -380,7 +380,25 @@ fn thread_sweep(cores: usize, quick: bool) -> Vec<(usize, f64)> {
     counts.dedup();
     let budget = Duration::from_millis(if quick { 400 } else { 900 });
     let per_thread = 64 * 1024 * 1024;
-    counts.into_iter().map(|c| (c, triad_bw(per_thread / c.max(1), c, budget))).collect()
+    // Best of several passes, first one discarded.
+    //
+    // A single pass is not reproducible. Measured on one machine, five consecutive runs of the
+    // old single-pass code gave 22.2, 33.4, 33.8, 34.6 and 34.6 GB/s single-threaded: the first
+    // pass after an idle period runs before the CPU has boosted and while the pages are still
+    // cold, so it reads about a third low. Taking the best of several passes removes that, and
+    // the best is the right statistic anyway: this is a ceiling, and interference only ever
+    // pushes it down.
+    let passes = if quick { 2 } else { 3 };
+    counts.into_iter().map(|c| {
+        let bytes = per_thread / c.max(1);
+        let _warmup = triad_bw(bytes, c, Duration::from_millis(120));   // discarded
+        let mut best = 0.0f64;
+        for _ in 0..passes {
+            let g = triad_bw(bytes, c, budget);
+            if g > best { best = g; }
+        }
+        (c, best)
+    }).collect()
 }
 
 fn bandwidth_sweep(cores: usize, ram_available_gb: Option<f64>, quick: bool) -> (Vec<BwPoint>, Vec<BwPoint>) {
@@ -975,7 +993,7 @@ fn http_agent(timeout: Duration) -> ureq::Agent {
     builder.build().into()
 }
 
-fn build_payload(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Option<Calibration>) -> String {
+fn build_payload(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Option<Calibration>, cond: &Conditions) -> String {
     let bucket = |x: f64, w: f64| (x / w).round() * w;
     let gpu_desc = gpu_description(inv);
     let class_input = format!(
@@ -1011,7 +1029,7 @@ fn build_payload(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Optio
     };
     let mem_known = inv.ram_total_gb.is_some();
     let payload = format!(
-        "{{\"class_hash\":{},\"source\":\"speedcheck\",\"platform\":{},\"arch\":{},\"gpu\":{},\"threads\":{},\"memory_gb\":{},\"memory_known\":{},\"bandwidth_gbps\":{},\"gflops_f32\":{},\"k\":{},\"runs\":{}}}",
+        "{{\"class_hash\":{},\"source\":\"speedcheck\",\"platform\":{},\"arch\":{},\"gpu\":{},\"threads\":{},\"memory_gb\":{},\"memory_known\":{},\"bandwidth_gbps\":{},\"gflops_f32\":{},\"k\":{},\"on_ac\":{},\"power_mode\":{},\"cpu_load_pct\":{},\"runs\":{}}}",
         jstr(&class_hash),
         jstr(&inv.os),
         jstr(&inv.arch),
@@ -1022,6 +1040,9 @@ fn build_payload(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Optio
         jnum(bw_gbps),
         jnum(gflops),
         k_json,
+        match cond.on_ac { Some(true) => "true", Some(false) => "false", None => "null" },
+        jstr(&cond.power_mode),
+        match cond.cpu_load_pct { Some(l) => jnum(l), None => "null".to_string() },
         runs_json
     );
     payload
@@ -1029,8 +1050,8 @@ fn build_payload(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Optio
 
 /// Send the receipt. Nothing leaves the machine until this is called, and it is only called
 /// after an explicit yes (or a bare Enter, which defaults to yes).
-fn submit_receipt(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Option<Calibration>, already_shown: bool) -> Result<String, String> {
-    let payload = build_payload(inv, bw_gbps, gflops, calibration);
+fn submit_receipt(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Option<Calibration>, cond: &Conditions, already_shown: bool) -> Result<String, String> {
+    let payload = build_payload(inv, bw_gbps, gflops, calibration, cond);
     if !already_shown && std::env::var("SJ_DEBUG").is_ok() {
         eprintln!("payload: {}", payload);
     }
@@ -1041,6 +1062,111 @@ fn submit_receipt(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Opti
         .send(payload.as_str())
         .map_err(|e| format!("{e}"))?;
     resp.body_mut().read_to_string().map_err(|e| format!("{e}"))
+}
+
+// ---------------------------------------------------------------- run conditions
+//
+// The same machine measured 20.3 GB/s and 34.6 GB/s within an hour. Neither number is wrong;
+// they were taken under different conditions. A dataset worth licensing has to record the
+// conditions, not just the result, or rows cannot be compared with each other.
+
+struct Conditions {
+    on_ac: Option<bool>,     // None when the machine has no battery at all (a desktop)
+    power_mode: String,      // the OS power plan or profile, verbatim
+    cpu_load_pct: Option<f64>,   // total load just before measuring
+    has_battery: bool,
+}
+
+fn conditions() -> Conditions {
+    let mut on_ac = None;
+    let mut power_mode = "unknown".to_string();
+    let mut cpu_load_pct = None;
+    let mut has_battery = false;
+
+    #[cfg(windows)]
+    {
+        // BatteryStatus: 1 = discharging, 2 = on AC. Absent entirely on a desktop.
+        if let Some(v) = ps("$b=Get-CimInstance Win32_Battery -EA SilentlyContinue; if($b){($b|Select-Object -First 1).BatteryStatus}else{'none'}") {
+            let v = v.trim().to_string();
+            if v == "none" || v.is_empty() {
+                has_battery = false;
+                on_ac = Some(true);          // no battery means it is mains powered
+            } else {
+                has_battery = true;
+                on_ac = Some(v != "1");
+            }
+        }
+        if let Some(v) = run("powercfg", &["/getactivescheme"]) {
+            // "Power Scheme GUID: <guid>  (Balanced)" -> "Balanced"
+            power_mode = v.rsplit('(').next().unwrap_or("").trim_end_matches(")
+").trim_end_matches(')').trim().to_string();
+            if power_mode.is_empty() { power_mode = v.trim().to_string(); }
+        }
+        if let Some(v) = ps("(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average") {
+            cpu_load_pct = v.trim().parse::<f64>().ok();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        for n in 0..4 {
+            if let Some(v) = read_file(&format!("/sys/class/power_supply/AC{}/online", n))
+                .or_else(|| read_file(&format!("/sys/class/power_supply/ADP{}/online", n))) {
+                on_ac = Some(v.trim() == "1");
+                break;
+            }
+        }
+        has_battery = read_file("/sys/class/power_supply/BAT0/status").is_some();
+        if !has_battery && on_ac.is_none() { on_ac = Some(true); }
+        if let Some(v) = read_file("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor") {
+            power_mode = v.trim().to_string();
+        }
+        // load average over the last minute, as a percentage of all cores
+        if let Some(v) = read_file("/proc/loadavg") {
+            if let Some(first) = v.split_whitespace().next().and_then(|x| x.parse::<f64>().ok()) {
+                let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1) as f64;
+                cpu_load_pct = Some((first / cores * 100.0).min(100.0));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(v) = run("pmset", &["-g", "batt"]) {
+            has_battery = v.contains("InternalBattery");
+            on_ac = Some(v.contains("AC Power"));
+            if !has_battery { on_ac = Some(true); }
+        }
+        if let Some(v) = run("pmset", &["-g", "therm"]) {
+            if v.contains("CPU_Speed_Limit") { power_mode = v.lines().find(|l| l.contains("CPU_Speed_Limit")).unwrap_or("").trim().to_string(); }
+        }
+        if let Some(v) = run("sh", &["-c", "sysctl -n vm.loadavg | awk '{print $2}'"]) {
+            if let Ok(first) = v.trim().parse::<f64>() {
+                let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1) as f64;
+                cpu_load_pct = Some((first / cores * 100.0).min(100.0));
+            }
+        }
+    }
+
+    Conditions { on_ac, power_mode, cpu_load_pct, has_battery }
+}
+
+/// Anything that makes this run not comparable with a clean one. Empty means conditions were fine.
+fn degraded(c: &Conditions) -> Vec<String> {
+    let mut w = Vec::new();
+    if c.has_battery && c.on_ac == Some(false) {
+        w.push("Running on battery; plug in for a full-speed result.".to_string());
+    }
+    let m = c.power_mode.to_ascii_lowercase();
+    if m.contains("saver") || m.contains("powersave") || m.contains("eco") {
+        w.push(format!("Power mode is \"{}\"; set it to Balanced or Best Performance for a full-speed result.", c.power_mode));
+    }
+    if let Some(l) = c.cpu_load_pct {
+        if l >= 25.0 {
+            w.push(format!("Other software is using about {:.0}% of the CPU; close it for a comparable result.", l));
+        }
+    }
+    w
 }
 
 // ---------------------------------------------------------------- reference models and derivation
@@ -1094,6 +1220,9 @@ fn main() {
 
     eprintln!("SAPHOJUICE probe v{}", VERSION);
     eprintln!("[1/8] inventory");
+    // before anything is measured, so the numbers can be compared with other runs later
+    let cond = conditions();
+    let warnings = degraded(&cond);
     let inv = inventory();
     eprintln!("  {} | {} | {} cores | isa {:?}", inv.cpu_name, inv.arch, inv.logical_cores, inv.isa);
     if let Some(t) = inv.ram_total_gb {
@@ -1182,6 +1311,15 @@ fn main() {
         _                  => println!("  Memory         unknown"),
     }
     println!("  Instructions   {}", if inv.isa.is_empty() { "none detected".to_string() } else { inv.isa.join(", ") });
+    println!("  Conditions     {}{}{}",
+             match (cond.has_battery, cond.on_ac) {
+                 (true, Some(true)) => "plugged in".to_string(),
+                 (true, Some(false)) => "on battery".to_string(),
+                 (false, _) => "mains powered".to_string(),
+                 (true, None) => "power source unknown".to_string(),
+             },
+             if cond.power_mode != "unknown" { format!(", {}", cond.power_mode) } else { String::new() },
+             match cond.cpu_load_pct { Some(l) => format!(", {:.0}% CPU busy at start", l), None => String::new() });
     let best_threads = thread_bw.iter().cloned().fold((0usize, 0f64), |a, b| if b.1 > a.1 { b } else { a });
     let sweep_desc: Vec<String> = thread_bw.iter().map(|(c, g)| format!("{}t {:.1}", c, g)).collect();
     println!("  Memory speed   {:.1} GB/s at {} thread{}   (measured at {})",
@@ -1236,6 +1374,11 @@ fn main() {
             jnum(ceiling), jnum(est), jnum(prefill), jnum(kv_gb), jnum(need), fits_total, fits_now
         ));
     }
+    if !warnings.is_empty() {
+        println!();
+        for w in &warnings { println!("  NOTE: {}", w); }
+        println!("  These numbers are a floor, not this machine's best.");
+    }
     if best_idx.is_some() {
         println!("  > recommended: the fastest model that fits in your free memory right now.");
     } else {
@@ -1279,7 +1422,7 @@ fn main() {
     if opts.show_payload {
         println!();
         println!("This is exactly what would be sent:");
-        println!("{}", build_payload(&inv, bw_for_pred, gemm_sustained, &calibration));
+        println!("{}", build_payload(&inv, bw_for_pred, gemm_sustained, &calibration, &cond));
         println!();
     }
     if opts.no_share {
@@ -1310,12 +1453,25 @@ fn main() {
         if !answer.is_empty() { println!("Not sent. Your numbers stayed on this machine."); }
         return;
     }
-    match submit_receipt(&inv, bw_for_pred, gemm_sustained, &calibration, opts.show_payload) {
+    match submit_receipt(&inv, bw_for_pred, gemm_sustained, &calibration, &cond, opts.show_payload) {
         Ok(body) => match json_str(&body, "id") {
             Some(id) => {
                 println!();
                 println!("Thank you. Your result is on the public table.");
-                println!("Share it: https://saphojuice.com/r/{}", id);
+                println!("Share it:  https://saphojuice.com/r/{}", id);
+                // The only proof this row is yours. Shown once, never published, and the sole
+                // way to delete it later: class_hash is public and cannot authorise deletion.
+                match json_str(&body, "delete_token") {
+                    Some(tok) => {
+                        println!();
+                        println!("Keep this if you may want it removed later. It is shown once:");
+                        println!("  delete token: {}", tok);
+                        println!("  to remove:    curl -X POST https://saphojuice.com/v1/delete \\");
+                        println!("                  -H 'content-type: application/json' \\");
+                        println!("                  -d '{{\"delete_token\":\"{}\"}}'", tok);
+                    }
+                    None => println!("(no delete token returned; contact hello@saphojuice.com to remove it)"),
+                }
             }
             None => println!("Sent. {}", body),
         },
