@@ -26,6 +26,9 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      # the action posts its result as a check run; without this it fails with
+      # "Resource not accessible by integration" even when the audit itself is clean
+      checks: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09   # v5
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
