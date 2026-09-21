@@ -1,0 +1,36 @@
+# Build artifacts
+target/
+**/target/
+
+# Prebuilt inference engines are not redistributed here; build your own (see speedcheck/README.md)
+speedcheck/engines/
+
+# Private: the lean-boot experiment is not part of this repo
+boot/
+
+# Private: go-to-market and buyer research. Only the receipt schema is public.
+docs/*
+!docs/receipt-schema.sql
+
+# Private: the Cloudflare Worker. Its schema is published as docs/receipt-schema.sql.
+worker/
+
+# Private: the website. Only the browser fit test is public, as browser/fit.js.
+site/
+
+# Downloaded models and images never belong in git
+*.gguf
+*.img
+*.deb
+*.zst
+*.xz
+models/
+output/
+build/
+dl/
+.cache/
+dist/
+
+# Local scratch
+.pwscratch2/
+node_modules/
