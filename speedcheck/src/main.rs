@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = "0.1.1";
 // Uncalibrated efficiency factor, replaced by a measured k when a generation run happens.
 // 0.8 matches what the browser test and the share pages assume, so the same machine gets
 // the same answer from the web and the CLI. It is also closer to what was actually measured
@@ -261,8 +261,12 @@ fn inventory() -> Inventory {
         } else {
             battery_json = "null".to_string();
         }
-        if power_plan.to_lowercase().contains("balanced") || power_plan.to_lowercase().contains("power saver") {
-            notes.push("Windows power plan is not Best Performance; ARM laptops in particular clock down. Rerun on Best Performance, plugged in.".to_string());
+        // This tested the legacy plan, which reads "Balanced" even when the Windows 11
+        // power mode slider is set to Best performance, so it fired on machines already
+        // configured correctly. Test the real mode instead.
+        let m = windows_power_mode(None, &power_plan).to_lowercase();
+        if m.contains("efficiency") || m.contains("power saver") {
+            notes.push("Windows power mode is not Best performance; ARM laptops in particular clock down. Rerun on Best performance, plugged in.".to_string());
         }
     } else if os == "linux" {
         if let Some(s) = read_file("/proc/cpuinfo") {
@@ -1077,6 +1081,32 @@ struct Conditions {
     has_battery: bool,
 }
 
+/// Windows 11 has two power layers and they disagree.
+///
+/// The legacy power plan (`powercfg /getactivescheme`) usually reads "Balanced" and stays there.
+/// What people actually set, the power mode slider in Settings, is stored separately as an
+/// "overlay" scheme. A machine set to Best performance still reports the Balanced plan, so
+/// reading only the plan records the wrong mode on essentially every Windows 11 laptop.
+///
+/// powercfg has no working flag for the overlay on current builds: /getactiveoverlayscheme,
+/// /overlaysetting and /overlay all return "Invalid Parameters". Read it from the registry,
+/// which is where powercfg itself keeps it.
+#[cfg(windows)]
+fn windows_power_mode(on_ac: Option<bool>, plan: &str) -> String {
+    const KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes";
+    let value = if on_ac == Some(false) { "ActiveOverlayDcPowerScheme" } else { "ActiveOverlayAcPowerScheme" };
+    let guid = run("reg", &["query", KEY, "/v", value])
+        .and_then(|s| s.split_whitespace().last().map(|g| g.trim().to_ascii_lowercase()));
+    match guid.as_deref() {
+        Some("ded574b5-45a0-4f42-8737-46345c09c238") => "Best performance".to_string(),
+        Some("3af9b8d9-7c97-431d-ad78-34a8bfea439f") => "Better performance".to_string(),
+        Some("961cc777-2547-4f9d-8174-7d86181b8a7a") => "Best power efficiency".to_string(),
+        // all zeroes means no overlay is applied, so the legacy plan really is the mode
+        Some("00000000-0000-0000-0000-000000000000") | None => plan.to_string(),
+        Some(other) => format!("{} (overlay {})", plan, other),
+    }
+}
+
 fn conditions() -> Conditions {
     let mut on_ac = None;
     let mut power_mode = "unknown".to_string();
@@ -1096,11 +1126,13 @@ fn conditions() -> Conditions {
                 on_ac = Some(v != "1");
             }
         }
+        let mut plan = "unknown".to_string();
         if let Some(v) = run("powercfg", &["/getactivescheme"]) {
             // "Power Scheme GUID: <guid>  (Balanced)" -> "Balanced"
-            power_mode = v.rsplit('(').next().unwrap_or("").trim_end_matches(")
+            plan = v.rsplit('(').next().unwrap_or("").trim_end_matches(")
 ").trim_end_matches(')').trim().to_string();
-            if power_mode.is_empty() { power_mode = v.trim().to_string(); }
+            if plan.is_empty() { plan = v.trim().to_string(); }
+        power_mode = windows_power_mode(on_ac, &plan);
         }
         if let Some(v) = ps("(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average") {
             cpu_load_pct = v.trim().parse::<f64>().ok();
@@ -1158,7 +1190,7 @@ fn degraded(c: &Conditions) -> Vec<String> {
         w.push("Running on battery; plug in for a full-speed result.".to_string());
     }
     let m = c.power_mode.to_ascii_lowercase();
-    if m.contains("saver") || m.contains("powersave") || m.contains("eco") {
+    if m.contains("saver") || m.contains("powersave") || m.contains("eco") || m.contains("efficiency") {
         w.push(format!("Power mode is \"{}\"; set it to Balanced or Best Performance for a full-speed result.", c.power_mode));
     }
     if let Some(l) = c.cpu_load_pct {
