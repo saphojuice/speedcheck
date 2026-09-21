@@ -76,6 +76,14 @@ browser/fit.js           in-browser estimate
 docs/receipt-schema.sql  receipt table shape
 ```
 
+## Creator & Maintainer
+
+[Agim Lolovic](https://github.com/agimlolovic)
+
+## Contributing
+
+SAPHOJUICE is open source. If you have a better way to benchmark local AI performance, estimate model compatibility, improve hardware detection, or add support for additional models or hardware, contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to share a hardware result, report a wrong prediction, or submit a pull request.
+
 ## License
 
 MIT. See `LICENSE`.
