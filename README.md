@@ -1,12 +1,18 @@
-# speedcheck
+# Why SAPHOJUICE Speedtest?
 
-I bought a ThinkPad X13s. Snapdragon, 16 GB, the kind of machine most people actually own. I wanted to run a model on it without sending my words to somebody else's server.
+I had a spare ThinkPad X13s sitting around. Snapdragon, 16 GB. It's been a workhorse.
 
-LM Studio terminated. The official llama.cpp Windows ARM64 build crashed the moment it tried to compute, because this chip lacks an instruction it assumed was there. Ollama ran, at five tokens a second, and told me nothing about why.
+I wanted to run a local AI model on it, or at least figure out what it could actually run before downloading a bunch of multi-gigabyte models.
 
-Three tools, and not one of them could answer the only question I had before downloading five gigabytes: will this run on my machine, and how fast?
+That turned out to be much harder than it should be.
 
-So I stopped reading forum posts and measured it. Memory bandwidth, compute, free memory, then a real model generating real tokens. The answer turned out to be one line of arithmetic: a model reads its whole weight file to produce each token, so speed is your memory bandwidth divided by the bytes it has to read. Predicted 24, 13 and 6 tokens a second for three model sizes. Measured 21.3, 9.6 and 5.5. Within fifteen percent across a fourfold range, on the machine everything else failed on.
+LM Studio terminated. The official llama.cpp Windows ARM64 build crashed the moment it tried to compute because the chip lacks an instruction the build assumed was there. Ollama ran, at about five tokens a second, but told me nothing about why.
+
+Three tools, and none could answer the question I had from the beginning:
+
+What AI can this machine actually run, and how fast? So I stopped guessing and measured it.
+
+Memory bandwidth, compute, free memory, then a real model generating real tokens. The answer turned out to be one line of arithmetic: a model reads its whole weight file to produce each token, so speed is your memory bandwidth divided by the bytes it has to read. Predicted 24, 13 and 6 tokens a second for three model sizes. Measured 21.3, 9.6 and 5.5. Within fifteen percent across a fourfold range, on the machine everything else failed on.
 
 That is the whole idea. Answer the question honestly, before the download, with a number from your own hardware instead of somebody's guess. This repo is the measurement half, public so anyone can check the numbers or tell me I'm wrong.
 
