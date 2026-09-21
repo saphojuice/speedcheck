@@ -55,6 +55,8 @@ k is this machine's efficiency factor. Expect 0.4 to 0.6 on small models and up 
 
 ## Notes
 
-- Prediction uses k=0.6 until calibrated; the receipt marks `k_calibrated: false` until a live generation run measures it.
+- Prediction uses k=0.8 until calibrated, the same value the browser test and the share pages
+  assume, so one machine gets one answer whichever way you measure it. The receipt marks
+  `k_calibrated: false` until a live generation run measures the real value.
 - Storage read may be page-cached; treat it as an upper bound.
 - No prompts, files, or names are collected. Hostname is stored as a hash only. The public-table submission is opt-in per run.

@@ -1,0 +1,125 @@
+#!/bin/sh
+# SAPHOJUICE speed check, macOS and Linux.
+#
+#   curl -fsSL https://saphojuice.com/check | sh
+#
+# Downloads the probe for this OS and CPU from the GitHub release, checks its SHA-256 against the
+# SHA256SUMS published with that release, runs it, then deletes it. Nothing is installed, nothing
+# is left behind, and no code signing is involved because the file does not persist.
+#
+# The binary is built in public CI from the source in this repository, so the hash you verify here
+# is the hash of a build anyone can reproduce and inspect.
+#
+# Source of truth: https://github.com/saphojuice/speedcheck/blob/main/scripts/check
+set -eu
+
+REPO="saphojuice/speedcheck"
+VERSION="${SJ_VERSION:-v0.1.0}"
+BASE="https://github.com/${REPO}/releases/download/${VERSION}"
+
+die() {
+  printf '\n  %s\n\n' "$*" >&2
+  exit 1
+}
+
+# ---- what are we on
+os_raw="$(uname -s 2>/dev/null || echo unknown)"
+arch_raw="$(uname -m 2>/dev/null || echo unknown)"
+
+case "$os_raw" in
+  Darwin) os="macos" ;;
+  Linux)  os="linux" ;;
+  *) die "SAPHOJUICE: unsupported operating system '${os_raw}'.
+  This script supports macOS and Linux. On Windows run this instead, in PowerShell:
+      irm https://saphojuice.com/check.ps1 | iex" ;;
+esac
+
+case "$arch_raw" in
+  arm64|aarch64) arch="arm64" ;;
+  x86_64|amd64)  arch="x64" ;;
+  *) die "SAPHOJUICE: unsupported CPU architecture '${arch_raw}'.
+  Builds exist for arm64 and x86_64. Please open an issue at
+      https://github.com/${REPO}/issues
+  and say which machine you are on, and we will look at adding it." ;;
+esac
+
+# The release matrix does not include linux-arm64 yet. Say so rather than 404.
+if [ "$os" = "linux" ] && [ "$arch" = "arm64" ]; then
+  die "SAPHOJUICE: there is no linux-arm64 build in release ${VERSION} yet.
+  You can build it yourself in about a minute:
+      git clone https://github.com/${REPO} && cd speedcheck/speedcheck && cargo run --release"
+fi
+
+asset="sj-probe-${os}-${arch}"
+
+# ---- tools
+if command -v curl >/dev/null 2>&1; then
+  fetch() { curl -fsSL "$1" -o "$2"; }
+elif command -v wget >/dev/null 2>&1; then
+  fetch() { wget -qO "$2" "$1"; }
+else
+  die "SAPHOJUICE: neither curl nor wget is available, so the probe cannot be downloaded."
+fi
+
+if command -v shasum >/dev/null 2>&1; then
+  sha_of() { shasum -a 256 "$1" | awk '{print $1}'; }
+elif command -v sha256sum >/dev/null 2>&1; then
+  sha_of() { sha256sum "$1" | awk '{print $1}'; }
+else
+  die "SAPHOJUICE: no sha256 tool found (looked for shasum and sha256sum).
+  The download cannot be verified, so it will not be run."
+fi
+
+# ---- scratch space that always goes away
+tmp="$(mktemp -d 2>/dev/null || mktemp -d -t sjcheck)"
+[ -d "$tmp" ] || die "SAPHOJUICE: could not create a temporary directory."
+
+cleanup() {
+  # deliberately unconditional: the binary must not survive this script, on any exit path
+  [ -n "${tmp:-}" ] && [ -d "$tmp" ] && rm -rf "$tmp"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+printf '\n  SAPHOJUICE speed check\n'
+printf '  %s %s, release %s\n' "$os" "$arch" "$VERSION"
+printf '  Downloading the probe (nothing is installed)...\n'
+
+fetch "${BASE}/${asset}" "${tmp}/${asset}" || die "SAPHOJUICE: could not download ${BASE}/${asset}
+  Check your connection, or that release ${VERSION} exists."
+fetch "${BASE}/SHA256SUMS" "${tmp}/SHA256SUMS" || die "SAPHOJUICE: could not download SHA256SUMS for ${VERSION}.
+  Refusing to run an unverified binary."
+
+expected="$(awk -v a="$asset" '$2 == a || $2 == "*"a {print $1}' "${tmp}/SHA256SUMS" | head -n 1)"
+[ -n "$expected" ] || die "SAPHOJUICE: ${asset} is not listed in SHA256SUMS for ${VERSION}.
+  Refusing to run an unverified binary."
+
+actual="$(sha_of "${tmp}/${asset}")"
+if [ "$actual" != "$expected" ]; then
+  die "SAPHOJUICE: SHA-256 MISMATCH. The download does not match the published release.
+
+    expected  ${expected}
+    actual    ${actual}
+
+  The file has NOT been run and has been deleted. This could be a corrupted download, or
+  something interfering with your connection. Try again; if it persists, please report it at
+      https://github.com/${REPO}/issues"
+fi
+
+printf '  SHA-256 verified: %s\n' "$expected"
+printf '  Running. This takes about 30 seconds.\n\n'
+
+chmod +x "${tmp}/${asset}"
+
+# Run with the terminal still attached so the consent prompt works even under `curl | sh`,
+# where stdin is the pipe rather than the keyboard.
+if [ -r /dev/tty ]; then
+  "${tmp}/${asset}" "$@" < /dev/tty || rc=$?
+else
+  "${tmp}/${asset}" "$@" || rc=$?
+fi
+rc=${rc:-0}
+
+printf '\n  Done. The probe has been deleted; nothing was installed.\n\n'
+exit "$rc"

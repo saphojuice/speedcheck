@@ -393,16 +393,21 @@
   // we have, same coarse number Chrome/Edge cap at 8 GB for privacy -- treated here as an estimate, not a spec.
   const RESERVE = 4;
   function grade(m, bwCpu, bwGpu, gpuMemGB, memGB, k, memKnown){
-    const need = m.file + m.kv + RESERVE;
+    const need = m.file + m.kv + RESERVE;   // weights + context + headroom for the OS and everything else
+    const bare = m.file + m.kv;             // weights + context alone, with nothing left over
     const useGpu = typeof bwGpu === 'number' && bwGpu > 0 && typeof gpuMemGB === 'number' && need <= gpuMemGB;
     const bw = useGpu ? bwGpu : bwCpu;
     const method = useGpu ? 'gpu' : 'cpu';
     const tps = k * bw / m.act;
-    const fits = memKnown ? need <= memGB : (need <= memGB ? true : null); // null = unknown above the browser cap
+    // true  = fits with headroom to spare
+    // null  = weights and context fit, but only if little else is resident. A browser is told the
+    //         total memory, never the free memory, so this genuinely cannot be resolved here.
+    // false = weights and context alone exceed the memory reported, so it cannot run at any setting
+    const fits = need <= memGB ? true : (bare <= memGB ? null : false);
     let band = 'no', label = 'Won’t fit';
-    if (fits !== false) { if (tps >= 30) { band='fast'; label='Fast'; } else if (tps >= 15) { band='fast'; label='Feels fast'; } else if (tps >= 8) { band='ok'; label='Reading pace'; } else { band='slow'; label='Slow'; } }
-    if (fits === null) label += ', if you have ' + Math.ceil(need) + ' GB';
-    return { need, fits, tps, band, label, lo: tps * 0.9, hi: tps * 1.1, bw, method };
+    if (fits === true) { if (tps >= 30) { band='fast'; label='Fast'; } else if (tps >= 15) { band='fast'; label='Feels fast'; } else if (tps >= 8) { band='ok'; label='Reading pace'; } else { band='slow'; label='Slow'; } }
+    else if (fits === null) { band = 'maybe'; label = 'Might fit, needs ' + Math.ceil(need) + ' GB free'; }
+    return { need, bare, fits, tps, band, label, lo: tps * 0.9, hi: tps * 1.1, bw, method };
   }
 
   async function measure(onPhase, opts){

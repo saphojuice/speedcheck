@@ -16,7 +16,11 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const VERSION: &str = "0.1.0";
-const DEFAULT_K: f64 = 0.6; // uncalibrated efficiency factor; replace with measured k
+// Uncalibrated efficiency factor, replaced by a measured k when a generation run happens.
+// 0.8 matches what the browser test and the share pages assume, so the same machine gets
+// the same answer from the web and the CLI. It is also closer to what was actually measured
+// on the reference machine (k = 0.83) than the 0.6 this used to assume.
+const DEFAULT_K: f64 = 0.8;
 const OS_RESERVE_GB: f64 = 4.0;
 const CTX_TOKENS: f64 = 8192.0;
 const CALIBRATION_SECONDS: f64 = 30.0;
@@ -31,6 +35,8 @@ struct Opts {
     out: String,
     skip_storage: bool,
     offline: bool,
+    no_share: bool,
+    show_payload: bool,
 }
 
 fn parse_opts() -> Result<Opts, String> {
@@ -38,9 +44,11 @@ fn parse_opts() -> Result<Opts, String> {
         bw_seconds: 60,
         gemm_seconds: 20,
         quick: false,
-        out: "sj_receipt.json".to_string(),
+        out: String::new(),
         skip_storage: false,
         offline: false,
+        no_share: false,
+        show_payload: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -65,9 +73,15 @@ fn parse_opts() -> Result<Opts, String> {
             }
             "--skip-storage" => o.skip_storage = true,
             "--offline" => o.offline = true,
+            "--no-share" => o.no_share = true,
+            "--show-payload" => o.show_payload = true,
             "-h" | "--help" => {
-                println!("sj-probe [--quick] [--bw-seconds N] [--gemm-seconds N] [--skip-storage] [--offline] [--out FILE]");
-                println!("  --offline    skip the model download and generation run; print physical measurements only");
+                println!("sj-probe [--quick] [--bw-seconds N] [--gemm-seconds N] [--skip-storage] [--offline]");
+                println!("         [--no-share] [--show-payload] [--out FILE]");
+                println!("  --offline       skip the model download and generation run; print physical measurements only");
+                println!("  --no-share      never ask and never send; measure and print only");
+                println!("  --show-payload  print the exact JSON that would be sent, before asking");
+                println!("  --out FILE      also write the full receipt JSON here (nothing is written otherwise)");
                 println!("sj-probe k --tokps X --model-gb Y --bw Z    compute efficiency factor k from a measured run");
                 std::process::exit(0);
             }
@@ -354,6 +368,19 @@ fn triad_bw(bytes_per_thread: usize, threads: usize, budget: Duration) -> f64 {
     } else {
         0.0
     }
+}
+
+// Bandwidth at 1, half and all cores, at a working set far larger than any cache, so the best
+// thread count is measured rather than assumed. More threads stop helping once the workload is
+// waiting on memory, and on some chips they make it worse.
+fn thread_sweep(cores: usize, quick: bool) -> Vec<(usize, f64)> {
+    let mut counts = vec![1usize];
+    if cores >= 4 { counts.push(cores / 2); }
+    if cores > 1 { counts.push(cores); }
+    counts.dedup();
+    let budget = Duration::from_millis(if quick { 400 } else { 900 });
+    let per_thread = 64 * 1024 * 1024;
+    counts.into_iter().map(|c| (c, triad_bw(per_thread / c.max(1), c, budget))).collect()
 }
 
 fn bandwidth_sweep(cores: usize, ram_available_gb: Option<f64>, quick: bool) -> (Vec<BwPoint>, Vec<BwPoint>) {
@@ -763,8 +790,7 @@ struct Calibration {
 
 fn download_and_verify(url: &str, dest: &Path, expected_sha256: &str, expected_size: u64) -> Result<(), String> {
     eprintln!("  downloading {}", url);
-    let config = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(1800))).build();
-    let agent: ureq::Agent = config.into();
+    let agent = http_agent(Duration::from_secs(1800));
     let mut resp = agent.get(url).call().map_err(|e| format!("request failed: {e}"))?;
     let mut reader = resp.body_mut().as_reader();
     let mut file = File::create(dest).map_err(|e| format!("create temp file: {e}"))?;
@@ -933,7 +959,23 @@ fn gpu_description(inv: &Inventory) -> Option<String> {
     None
 }
 
-fn submit_receipt(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Option<Calibration>) -> Result<String, String> {
+/// One place that knows which TLS provider this build actually has. ureq decides at runtime and
+/// defaults to Rustls, so a native-tls-only build panics on the first https request unless told.
+fn http_agent(timeout: Duration) -> ureq::Agent {
+    let builder = ureq::Agent::config_builder().timeout_global(Some(timeout));
+    #[cfg(windows)]
+    let builder = builder.tls_config(
+        ureq::tls::TlsConfig::builder()
+            .provider(ureq::tls::TlsProvider::NativeTls)
+            // building a TlsConfig from scratch drops the default root store. SChannel wants the
+            // Windows certificate store; bundled webpki roots are rejected as user-specified.
+            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+            .build(),
+    );
+    builder.build().into()
+}
+
+fn build_payload(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Option<Calibration>) -> String {
     let bucket = |x: f64, w: f64| (x / w).round() * w;
     let gpu_desc = gpu_description(inv);
     let class_input = format!(
@@ -982,9 +1024,17 @@ fn submit_receipt(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Opti
         k_json,
         runs_json
     );
+    payload
+}
 
-    let config = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).build();
-    let agent: ureq::Agent = config.into();
+/// Send the receipt. Nothing leaves the machine until this is called, and it is only called
+/// after an explicit yes (or a bare Enter, which defaults to yes).
+fn submit_receipt(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Option<Calibration>, already_shown: bool) -> Result<String, String> {
+    let payload = build_payload(inv, bw_gbps, gflops, calibration);
+    if !already_shown && std::env::var("SJ_DEBUG").is_ok() {
+        eprintln!("payload: {}", payload);
+    }
+    let agent = http_agent(Duration::from_secs(20));
     let mut resp = agent
         .post("https://saphojuice.com/v1/receipt")
         .content_type("application/json")
@@ -997,20 +1047,32 @@ fn submit_receipt(inv: &Inventory, bw_gbps: f64, gflops: f64, calibration: &Opti
 
 struct RefModel {
     name: &'static str,
-    total_gb: f64,   // Q4_K_M file size, approximate
-    active_gb: f64,  // bytes read per token (== total for dense)
-    kv_kb_per_tok: f64, // f16 KV cache bytes per token / 1024
+    total_gb: f64,        // Q4_K_M file size, from the Hugging Face API
+    active_gb: f64,       // bytes read per token (== total for dense, active experts for MoE)
+    kv_kb_per_tok: f64,   // f16 KV cache bytes per token / 1024
     params_active_b: f64, // active params in billions (for prefill flops)
+    hf: &'static str,     // Hugging Face repo
+    gguf: &'static str,   // exact file in that repo
+    quant: &'static str,
+    lic: &'static str,
+    ollama: &'static str, // one command, if Ollama is installed
 }
 
 fn reference_models() -> Vec<RefModel> {
+    // The same five models the site grades, with repo, quant and size checked against the
+    // Hugging Face API and the Ollama registry on 20 September 2026. Keep in step with
+    // worker/catalog.js and the CAT array in site/index.html.
     vec![
-        RefModel { name: "Qwen3-0.6B Q4_K_M", total_gb: 0.40, active_gb: 0.40, kv_kb_per_tok: 112.0, params_active_b: 0.6 },
-        RefModel { name: "Qwen3-1.7B Q4_K_M", total_gb: 1.10, active_gb: 1.10, kv_kb_per_tok: 112.0, params_active_b: 1.7 },
-        RefModel { name: "Qwen3-4B Q4_K_M", total_gb: 2.50, active_gb: 2.50, kv_kb_per_tok: 144.0, params_active_b: 4.0 },
-        RefModel { name: "Llama-3.1-8B Q4_K_M", total_gb: 4.90, active_gb: 4.90, kv_kb_per_tok: 128.0, params_active_b: 8.0 },
-        RefModel { name: "Qwen3-14B Q4_K_M", total_gb: 9.00, active_gb: 9.00, kv_kb_per_tok: 160.0, params_active_b: 14.0 },
-        RefModel { name: "Qwen3-30B-A3B Q4_K_M (MoE)", total_gb: 18.6, active_gb: 2.00, kv_kb_per_tok: 96.0, params_active_b: 3.3 },
+        RefModel { name: "Qwen3 1.7B", total_gb: 1.11, active_gb: 1.11, kv_kb_per_tok: 112.0, params_active_b: 1.7,
+                   hf: "unsloth/Qwen3-1.7B-GGUF", gguf: "Qwen3-1.7B-Q4_K_M.gguf", quant: "Q4_K_M", lic: "Apache 2.0", ollama: "qwen3:1.7b" },
+        RefModel { name: "Qwen3 4B", total_gb: 2.50, active_gb: 2.50, kv_kb_per_tok: 144.0, params_active_b: 4.0,
+                   hf: "unsloth/Qwen3-4B-GGUF", gguf: "Qwen3-4B-Q4_K_M.gguf", quant: "Q4_K_M", lic: "Apache 2.0", ollama: "qwen3:4b" },
+        RefModel { name: "Qwen3 8B", total_gb: 5.03, active_gb: 5.03, kv_kb_per_tok: 128.0, params_active_b: 8.0,
+                   hf: "unsloth/Qwen3-8B-GGUF", gguf: "Qwen3-8B-Q4_K_M.gguf", quant: "Q4_K_M", lic: "Apache 2.0", ollama: "qwen3:8b" },
+        RefModel { name: "Qwen3 14B", total_gb: 9.00, active_gb: 9.00, kv_kb_per_tok: 160.0, params_active_b: 14.0,
+                   hf: "unsloth/Qwen3-14B-GGUF", gguf: "Qwen3-14B-Q4_K_M.gguf", quant: "Q4_K_M", lic: "Apache 2.0", ollama: "qwen3:14b" },
+        RefModel { name: "Qwen3 30B-A3B", total_gb: 18.56, active_gb: 2.00, kv_kb_per_tok: 96.0, params_active_b: 3.3,
+                   hf: "unsloth/Qwen3-30B-A3B-GGUF", gguf: "Qwen3-30B-A3B-Q4_K_M.gguf", quant: "Q4_K_M MoE", lic: "Apache 2.0", ollama: "qwen3:30b-a3b" },
     ]
 }
 
@@ -1046,6 +1108,8 @@ fn main() {
     let dram_bw = bw_multi.last().map(|p| p.gbps).unwrap_or(0.0);
     let dram_bw_single = bw_single.last().map(|p| p.gbps).unwrap_or(0.0);
     let peak_cache_bw = bw_multi.iter().map(|p| p.gbps).fold(0.0, f64::max);
+    let thread_bw = thread_sweep(inv.logical_cores, opts.quick);
+    for (c, g) in &thread_bw { eprintln!("  {} thread(s)  {:.1} GB/s", c, g); }
 
     eprintln!("[3/8] compute");
     let gemm_budget = if opts.quick { Duration::from_secs(2) } else { Duration::from_secs(4) };
@@ -1075,33 +1139,9 @@ fn main() {
         eprintln!("  write {:.2} GB/s, read {:.2} GB/s (512 MB, read may be page-cached)", w, r);
     }
 
-    eprintln!("[6/8] derive");
+    eprintln!("[6/8] model calibration");
     let ram_total = inv.ram_total_gb.unwrap_or(0.0);
     let bw_for_pred = if bw_sustained > 0.0 { bw_sustained } else { dram_bw };
-    let mut pred_json = Vec::new();
-    println!();
-    println!("Reference predictions (bandwidth {:.1} GB/s sustained, k={} uncalibrated, ctx {} tokens):", bw_for_pred, DEFAULT_K, CTX_TOKENS as u64);
-    println!("{:<30} {:>8} {:>8} {:>9} {:>9} {:>6}", "model", "ceilTPS", "estTPS", "prefillTPS", "needGB", "fits");
-    for m in reference_models() {
-        let ceiling = if m.active_gb > 0.0 { bw_for_pred / m.active_gb } else { 0.0 };
-        let est = DEFAULT_K * ceiling;
-        // prefill: compute bound; 2 flops per active param per token; assume ~50% of measured GEMM achievable
-        let prefill = if m.params_active_b > 0.0 { (gemm_sustained.max(gemm_mt * 0.5) * 0.5) / (2.0 * m.params_active_b) } else { 0.0 };
-        let kv_gb = m.kv_kb_per_tok * CTX_TOKENS / 1024.0 / 1024.0;
-        let need = m.total_gb + kv_gb + OS_RESERVE_GB;
-        let fits = ram_total > 0.0 && need <= ram_total;
-        println!("{:<30} {:>8.1} {:>8.1} {:>9.0} {:>9.1} {:>6}", m.name, ceiling, est, prefill, need, if fits { "yes" } else { "no" });
-        pred_json.push(format!(
-            "{{\"model\":{},\"total_gb\":{},\"active_gb\":{},\"decode_ceiling_tps\":{},\"decode_est_tps\":{},\"prefill_est_tps\":{},\"kv_gb_at_ctx\":{},\"need_gb\":{},\"fits\":{}}}",
-            jstr(m.name), jnum(m.total_gb), jnum(m.active_gb), jnum(ceiling), jnum(est), jnum(prefill), jnum(kv_gb), jnum(need), fits
-        ));
-    }
-    println!();
-    println!("DRAM bandwidth: {:.1} GB/s peak, {:.1} GB/s sustained ({:.0}% decay). Single-thread {:.1} GB/s. Peak cache {:.1} GB/s.", dram_bw, bw_sustained, bw_decay * 100.0, dram_bw_single, peak_cache_bw);
-    println!("Compute: {:.1} GFLOPS f32 peak, {:.1} sustained ({:.0}% decay). int8 {:.1} Gops.", gemm_mt, gemm_sustained, gemm_decay * 100.0, i8_mt);
-    println!("Next: run llama-bench on a small model, then `sj-probe k --tokps <tg> --model-gb <file GB> --bw {:.1}` to get this machine's k.", bw_for_pred);
-
-    eprintln!("[7/8] model calibration");
     let calibration: Option<Calibration> = if opts.offline {
         eprintln!("  --offline: skipping model download and generation run");
         None
@@ -1126,6 +1166,83 @@ fn main() {
         None => "null".to_string(),
     };
 
+    eprintln!("[7/8] derive");
+    let mut pred_json = Vec::new();
+    let free_gb = inv.ram_available_gb.unwrap_or(0.0);
+    let k_report = calibration.as_ref().map(|c| c.k_measured).filter(|k| *k > 0.0).unwrap_or(DEFAULT_K);
+    let k_is_measured = calibration.as_ref().map(|c| c.k_measured > 0.0).unwrap_or(false);
+
+    println!();
+    println!("MACHINE  (measured on this computer just now)");
+    println!("  CPU            {}", inv.cpu_name);
+    println!("  Cores          {} logical", inv.logical_cores);
+    match (inv.ram_total_gb, inv.ram_available_gb) {
+        (Some(t), Some(a)) => println!("  Memory         {:.1} GB total, {:.1} GB free right now", t, a),
+        (Some(t), None)    => println!("  Memory         {:.1} GB total, free memory unknown", t),
+        _                  => println!("  Memory         unknown"),
+    }
+    println!("  Instructions   {}", if inv.isa.is_empty() { "none detected".to_string() } else { inv.isa.join(", ") });
+    let best_threads = thread_bw.iter().cloned().fold((0usize, 0f64), |a, b| if b.1 > a.1 { b } else { a });
+    let sweep_desc: Vec<String> = thread_bw.iter().map(|(c, g)| format!("{}t {:.1}", c, g)).collect();
+    println!("  Memory speed   {:.1} GB/s at {} thread{}   (measured at {})",
+             best_threads.1, best_threads.0, if best_threads.0 == 1 { "" } else { "s" }, sweep_desc.join(", "));
+    println!("  Sustained      {:.1} GB/s over {}s", bw_sustained, opts.bw_seconds);
+    println!("  Compute        {:.1} GFLOP/s f32, {:.1} Gops int8", gemm_sustained.max(gemm_mt), i8_mt);
+    println!("  Detail         DRAM {:.1} peak / {:.1} sustained GB/s ({:.0}% decay), 1 thread {:.1}, cache {:.0} GB/s",
+             dram_bw, bw_sustained, bw_decay * 100.0, dram_bw_single, peak_cache_bw);
+
+    println!();
+    if k_is_measured {
+        println!("MODELS  (tok/s measured from a real generation run on this machine, k = {:.2})", k_report);
+    } else {
+        println!("MODELS  (tok/s PREDICTED from the memory speed above, k = {:.2} assumed.", k_report);
+        println!("         No model was generated: a bundled engine lands in a later release.)");
+    }
+    println!();
+
+    // the recommended pick: the fastest model that fits in free memory right now
+    let models = reference_models();
+    let mut best_idx: Option<usize> = None;
+    for (i, m) in models.iter().enumerate() {
+        let kv = m.kv_kb_per_tok * CTX_TOKENS / 1024.0 / 1024.0;
+        if free_gb > 0.0 && (m.total_gb + kv) <= free_gb {
+            let tps = k_report * (if m.active_gb > 0.0 { bw_for_pred / m.active_gb } else { 0.0 });
+            if tps >= 8.0 || best_idx.is_none() { best_idx = Some(i); }
+        }
+    }
+
+    for (i, m) in models.iter().enumerate() {
+        let ceiling = if m.active_gb > 0.0 { bw_for_pred / m.active_gb } else { 0.0 };
+        let est = k_report * ceiling;
+        let prefill = if m.params_active_b > 0.0 { (gemm_sustained.max(gemm_mt * 0.5) * 0.5) / (2.0 * m.params_active_b) } else { 0.0 };
+        let kv_gb = m.kv_kb_per_tok * CTX_TOKENS / 1024.0 / 1024.0;
+        let need = m.total_gb + kv_gb + OS_RESERVE_GB;
+        let fits_now = free_gb > 0.0 && (m.total_gb + kv_gb) <= free_gb;
+        let fits_total = ram_total > 0.0 && need <= ram_total;
+        let mark = if Some(i) == best_idx { ">" } else { " " };
+        let verdict = if free_gb <= 0.0 { "free memory unknown".to_string() }
+            else if fits_now { "fits in free memory now".to_string() }
+            else if fits_total { format!("needs {:.1} GB free, you have {:.1} GB", m.total_gb + kv_gb, free_gb) }
+            else { format!("will not fit: needs {:.1} GB", m.total_gb + kv_gb) };
+        let tps_str = format!("~{:.1}", est);
+        println!("{} {:<14} {:>7} tok/s {}   {:>6.2} GB   {}",
+                 mark, m.name, tps_str, if k_is_measured { "measured " } else { "predicted" }, m.total_gb, verdict);
+        println!("      {} · {} · {} · {}", m.hf, m.gguf, m.quant, m.lic);
+        println!("      ollama run {}", m.ollama);
+        println!();
+        pred_json.push(format!(
+            "{{\"model\":{},\"hf\":{},\"gguf\":{},\"quant\":{},\"total_gb\":{},\"active_gb\":{},\"decode_ceiling_tps\":{},\"decode_est_tps\":{},\"prefill_est_tps\":{},\"kv_gb_at_ctx\":{},\"need_gb\":{},\"fits\":{},\"fits_free_now\":{}}}",
+            jstr(m.name), jstr(m.hf), jstr(m.gguf), jstr(m.quant), jnum(m.total_gb), jnum(m.active_gb),
+            jnum(ceiling), jnum(est), jnum(prefill), jnum(kv_gb), jnum(need), fits_total, fits_now
+        ));
+    }
+    if best_idx.is_some() {
+        println!("  > recommended: the fastest model that fits in your free memory right now.");
+    } else {
+        println!("  Nothing fits in the memory free right now. Close some applications and run this again.");
+    }
+
+
     // ---- receipt JSON
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let bw_multi_json: Vec<String> = bw_multi.iter().map(|p| format!("{{\"working_set_mb\":{},\"threads\":{},\"gbps\":{}}}", jnum(p.bytes_per_thread as f64 * 3.0 * p.threads as f64 / 1e6), p.threads, jnum(p.gbps))).collect();
@@ -1148,22 +1265,61 @@ fn main() {
         calibration_json,
         notes_json.join(",")
     );
-    match std::fs::write(&opts.out, receipt.as_bytes()) {
-        Ok(_) => println!("Receipt written to {}", opts.out),
-        Err(e) => eprintln!("could not write receipt: {}", e),
+    // Nothing is written to disk unless asked. A one-liner run must leave the machine as it
+    // found it, and dropping a JSON file in whatever directory the user happened to be in is
+    // not that.
+    if !opts.out.is_empty() {
+        match std::fs::write(&opts.out, receipt.as_bytes()) {
+            Ok(_) => println!("Full receipt written to {}", opts.out),
+            Err(e) => eprintln!("could not write receipt: {}", e),
+        }
     }
 
     eprintln!("[8/8] share");
-    print!("Add this anonymous result to the public table? (y/N): ");
+    if opts.show_payload {
+        println!();
+        println!("This is exactly what would be sent:");
+        println!("{}", build_payload(&inv, bw_for_pred, gemm_sustained, &calibration));
+        println!();
+    }
+    if opts.no_share {
+        println!();
+        println!("--no-share: nothing was sent.");
+        return;
+    }
+    println!();
+    println!("Share this result with the SAPHOJUICE community? It helps everyone with your chip get a better answer.");
+    println!("Hardware and speed numbers only. No name, no account, nothing you type.");
+    println!("Published as anonymous aggregate data. [Y/n]");
+    print!("> ");
     let _ = std::io::stdout().flush();
     let mut answer = String::new();
-    if std::io::stdin().read_line(&mut answer).is_ok() && answer.trim().eq_ignore_ascii_case("y") {
-        match submit_receipt(&inv, bw_for_pred, gemm_sustained, &calibration) {
-            Ok(body) => println!("sent. {}", body),
-            Err(e) => eprintln!("could not submit: {}", e),
+    // Default yes means a bare Enter shares. End of input is NOT a bare Enter: it means nobody
+    // was there to answer, which is not consent, so that case sends nothing.
+    let share = match std::io::stdin().read_line(&mut answer) {
+        Ok(0) => {
+            println!();
+            println!("No answer possible (no terminal attached), so nothing was sent.");
+            println!("Run it again from a terminal, or pass --no-share to skip this prompt.");
+            false
         }
-    } else {
-        println!("not sent.");
+        Ok(_) => !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no"),
+        Err(_) => false,
+    };
+    if !share {
+        if !answer.is_empty() { println!("Not sent. Your numbers stayed on this machine."); }
+        return;
+    }
+    match submit_receipt(&inv, bw_for_pred, gemm_sustained, &calibration, opts.show_payload) {
+        Ok(body) => match json_str(&body, "id") {
+            Some(id) => {
+                println!();
+                println!("Thank you. Your result is on the public table.");
+                println!("Share it: https://saphojuice.com/r/{}", id);
+            }
+            None => println!("Sent. {}", body),
+        },
+        Err(e) => eprintln!("Could not send: {}", e),
     }
 }
 

@@ -5,7 +5,17 @@ edition = "2021"
 description = "SAPHOJUICE machine probe: measures the physical constants that determine local LLM speed"
 license = "MIT"
 
-[dependencies]
+# TLS backend per platform.
+# Windows uses SChannel through native-tls: rustls pulls in ring, whose aarch64 Windows
+# assembly needs clang, which is not part of a normal MSVC install and would make the
+# windows-arm64 build depend on an extra toolchain. Verified building on windows-arm64
+# with MSVC alone. Everywhere else rustls, so the Linux build stays static against musl.
+[target.'cfg(windows)'.dependencies]
+# platform-verifier lets SChannel use the Windows certificate store. Bundled webpki roots do
+# not work here: SChannel treats them as user-specified roots and rejects the chain.
+ureq = { version = "3", default-features = false, features = ["native-tls", "platform-verifier"] }
+
+[target.'cfg(not(windows))'.dependencies]
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [profile.release]
