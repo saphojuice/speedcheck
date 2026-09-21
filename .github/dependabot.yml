@@ -1,0 +1,20 @@
+# Keeps the two things that can pull code into a release up to date: the Rust dependency tree
+# and the GitHub Actions used to build it. Actions are pinned to commit SHAs in the workflow;
+# Dependabot understands that and bumps the SHA with the tag comment.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /speedcheck
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"

@@ -1,0 +1,62 @@
+name: Bug
+description: Something is broken, crashed, or does not do what it says.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a security problem, please do not use this form. See
+        [SECURITY.md](https://github.com/saphojuice/speedcheck/blob/main/SECURITY.md) and report
+        privately to hello@saphojuice.com.
+
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      options:
+        - The one-line check (scripts/check or check.ps1)
+        - The native probe (sj-probe)
+        - The browser test on saphojuice.com
+        - A share page (/r/...)
+        - The repository itself (docs, CI, build)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what happened, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Exact output or error
+      description: Paste it verbatim. A screenshot of a terminal is harder to read than the text.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The probe prints it on the first line. For the website, the date and browser will do.
+      placeholder: "sj-probe v0.1.1, or: saphojuice.com in Firefox 148, 21 Sep"
+
+  - type: input
+    id: machine
+    attributes:
+      label: Machine and OS
+      placeholder: ThinkPad X13s, Windows 11 on ARM
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: repro
+    attributes:
+      label: Reproducibility
+      options:
+        - label: It happens every time
+        - label: I can reproduce it from a clean state (new terminal, or a private browser window)

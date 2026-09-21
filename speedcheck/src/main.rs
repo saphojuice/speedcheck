@@ -222,6 +222,8 @@ fn inventory() -> Inventory {
     let os = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
     let logical_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    // only written on some targets, since a few notes are platform specific
+    #[allow(unused_mut)]
     let mut notes = Vec::new();
 
     let host = std::env::var("COMPUTERNAME")
@@ -264,9 +266,16 @@ fn inventory() -> Inventory {
         // This tested the legacy plan, which reads "Balanced" even when the Windows 11
         // power mode slider is set to Best performance, so it fired on machines already
         // configured correctly. Test the real mode instead.
-        let m = windows_power_mode(None, &power_plan).to_lowercase();
-        if m.contains("efficiency") || m.contains("power saver") {
-            notes.push("Windows power mode is not Best performance; ARM laptops in particular clock down. Rerun on Best performance, plugged in.".to_string());
+        //
+        // cfg, not the surrounding runtime `if os == "windows"`: windows_power_mode is
+        // #[cfg(windows)] and simply does not exist when compiling for macOS or Linux, so a
+        // runtime check still fails to compile there.
+        #[cfg(windows)]
+        {
+            let m = windows_power_mode(None, &power_plan).to_lowercase();
+            if m.contains("efficiency") || m.contains("power saver") {
+                notes.push("Windows power mode is not Best performance; ARM laptops in particular clock down. Rerun on Best performance, plugged in.".to_string());
+            }
         }
     } else if os == "linux" {
         if let Some(s) = read_file("/proc/cpuinfo") {
@@ -1126,6 +1135,8 @@ fn conditions() -> Conditions {
                 on_ac = Some(v != "1");
             }
         }
+        // fallback when powercfg is unavailable; the compiler cannot see that path
+        #[allow(unused_assignments)]
         let mut plan = "unknown".to_string();
         if let Some(v) = run("powercfg", &["/getactivescheme"]) {
             // "Power Scheme GUID: <guid>  (Balanced)" -> "Balanced"
@@ -1148,7 +1159,7 @@ fn conditions() -> Conditions {
                 break;
             }
         }
-        has_battery = read_file("/sys/class/power_supply/BAT0/status").is_some();
+        if read_file("/sys/class/power_supply/BAT0/status").is_some() { has_battery = true; }
         if !has_battery && on_ac.is_none() { on_ac = Some(true); }
         if let Some(v) = read_file("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor") {
             power_mode = v.trim().to_string();

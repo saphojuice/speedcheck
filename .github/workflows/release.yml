@@ -1,25 +1,43 @@
 name: release
 
-# Builds the probe in public CI from the public source, so anyone can check that the binary
-# they download matches the code in this repository. Pushing a v* tag publishes the binaries
-# as release assets, with SHA256SUMS both as an asset (the install scripts fetch it) and in
-# the release body (so a human can read it without downloading anything).
+# Builds the probe in public CI from the public source, so anyone can check that the binary they
+# download matches the code in this repository. Pushing a v* tag publishes the binaries as release
+# assets with SHA256SUMS, an SBOM per binary, and GitHub build provenance attestations.
+#
+# Every third-party action is pinned to a commit SHA, not a tag. A tag can be moved; a SHA cannot.
+# The comment after each SHA records which tag it was at the time of pinning.
 #
 # Runner labels checked against GitHub's hosted-runner list on 21 September 2026.
-# Note macos-13 is gone: Intel macOS is macos-15-intel now.
+# macos-13 is retired: Intel macOS is macos-15-intel. windows-11-arm moved to Visual Studio 2026
+# on 21 September 2026, so the image is named explicitly rather than left to drift.
 
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:        # lets the matrix be exercised without cutting a release
+  workflow_dispatch:
 
+# Least privilege by default; jobs opt in to what they actually need.
 permissions:
-  contents: write           # needed to create the release
+  contents: read
 
 jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09   # v5
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: speedcheck
+
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -51,10 +69,10 @@ jobs:
             bin: sj-probe
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09   # v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # master
         with:
           # pinned, not "stable": a release binary should be reproducible from a named compiler
           toolchain: 1.98.0
@@ -70,8 +88,8 @@ jobs:
             echo "VCToolsVersion=${VCToolsVersion:-unset}  VSINSTALLDIR=${VSINSTALLDIR:-unset}"
           fi
 
-      # musl keeps the Linux binary static, so it runs on any distro regardless of glibc
-      # version. ring needs a C compiler for its assembly; musl-gcc is that compiler.
+      # musl keeps the Linux binary static, so it runs on any distro regardless of glibc version.
+      # ring needs a C compiler for its assembly; musl-gcc is that compiler.
       - name: Install musl toolchain
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
@@ -79,11 +97,11 @@ jobs:
           sudo apt-get install -y musl-tools
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
 
-      # --locked on purpose: a release binary must build from the committed lockfile, or the
-      # hash people verify is not the hash of the source they read. If this fails with "cannot
-      # update the lock file", the lockfile is stale: run `cargo generate-lockfile` in
-      # speedcheck/ and commit the result. A lockfile covers every target, not just the host,
-      # so changing a platform-specific dependency changes it for all of them.
+      # --locked on purpose: a release binary must build from the committed lockfile, or the hash
+      # people verify is not the hash of the source they read. If this fails with "cannot update
+      # the lock file", the lockfile is stale: run `cargo generate-lockfile` in speedcheck/ and
+      # commit the result. A lockfile covers every target, not just the host, so changing a
+      # platform-specific dependency changes it for all of them.
       - name: Build
         working-directory: speedcheck
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -92,7 +110,7 @@ jobs:
         working-directory: speedcheck
         shell: bash
         run: |
-          # cross-built Intel macOS cannot run on the arm64 runner, and vice versa
+          # a cross-built Intel macOS binary cannot run on an arm64 runner
           if [ "${{ matrix.name }}" = "macos-x64" ] && [ "$(uname -m)" = "arm64" ]; then
             echo "cross build, skipping run"; exit 0
           fi
@@ -104,36 +122,56 @@ jobs:
           mkdir -p dist
           cp "speedcheck/target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
 
-      - uses: actions/upload-artifact@v4
+      - name: SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0
+        with:
+          path: speedcheck
+          format: spdx-json
+          artifact-name: ${{ matrix.asset }}.spdx.json
+          output-file: dist/${{ matrix.asset }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}*
           if-no-files-found: error
 
   release:
     name: publish release
-    needs: build
+    needs: [build, audit]
     runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write        # create the release
+      id-token: write        # sign the provenance attestation
+      attestations: write    # record it
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09   # v5
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5
         with:
           path: staged
           merge-multiple: true
 
       - name: Compute SHA256SUMS
-        id: sums
         run: |
           cd staged
           ls -la
-          sha256sum sj-probe-* > SHA256SUMS
+          sha256sum sj-probe-* | grep -v '\.spdx\.json$' > SHA256SUMS
           cat SHA256SUMS
+
+      # Signed, verifiable proof that these exact binaries came out of this workflow, from this
+      # commit. Anyone can check one with:
+      #   gh attestation verify sj-probe-linux-x64 --repo saphojuice/speedcheck
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be  # v2
+        with:
+          subject-path: 'staged/sj-probe-*[!n]'
 
       - name: Write release notes
         run: |
-          TAG="${GITHUB_REF_NAME}"
           {
             echo "One command. Nothing installs, nothing is left on the machine."
             echo
@@ -148,7 +186,20 @@ jobs:
             echo '```'
             echo
             echo "The scripts download the binary for your platform, verify its SHA-256 against the list below, run it, and delete it."
-            echo "Every binary here was built by GitHub Actions from the source in this repository, so the hashes are reproducible from public code."
+            echo
+            echo "### Verifying a download"
+            echo
+            echo "Hash, against the list below:"
+            echo '```'
+            echo 'shasum -a 256 sj-probe-macos-arm64     # or sha256sum on Linux'
+            echo '```'
+            echo
+            echo "Build provenance, which proves it came from this repository's CI and not from anywhere else:"
+            echo '```'
+            echo 'gh attestation verify sj-probe-macos-arm64 --repo saphojuice/speedcheck'
+            echo '```'
+            echo
+            echo "An SBOM (SPDX) is attached for each binary. Changes are in [CHANGELOG.md](https://github.com/saphojuice/speedcheck/blob/main/CHANGELOG.md)."
             echo
             echo '## SHA256SUMS'
             echo '```'

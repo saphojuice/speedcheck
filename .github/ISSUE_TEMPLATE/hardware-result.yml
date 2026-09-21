@@ -1,0 +1,77 @@
+name: Hardware result
+description: Share what your machine measured. This is the most useful contribution.
+title: "[result] "
+labels: ["hardware result"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. Every result checks the predictions against a real machine, which is the only
+        way this gets more accurate.
+
+        Run either test first:
+
+        ```
+        curl -fsSL https://saphojuice.com/check | sh      # macOS and Linux
+        irm https://saphojuice.com/check.ps1 | iex        # Windows, in PowerShell
+        ```
+
+        Nothing is installed and nothing is left behind. You can paste the whole output below.
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Test output
+      description: Paste everything the test printed. If you used the browser test, paste the numbers from the result card instead.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: Make and model, as you would say it out loud.
+      placeholder: ThinkPad X13s Gen 1, Snapdragon 8cx Gen 3, 16 GB
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      placeholder: Windows 11 26H1 on ARM
+    validations:
+      required: true
+
+  - type: dropdown
+    id: power
+    attributes:
+      label: Power
+      description: This matters more than people expect. Laptops clock down hard on battery.
+      options:
+        - Plugged in
+        - On battery
+        - Desktop, mains only
+    validations:
+      required: true
+
+  - type: textarea
+    id: ollama
+    attributes:
+      label: Real measurement from Ollama (optional, but the most valuable part)
+      description: |
+        If you have Ollama, run a model and paste the `eval rate` line. A measured rate is worth
+        far more than a prediction, because it is what the prediction gets checked against.
+
+        ```
+        ollama run qwen3:4b --verbose
+        ```
+      render: text
+      placeholder: "eval rate:            9.62 tokens/s"
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Anything that looked wrong, surprising, or different from what you expected.

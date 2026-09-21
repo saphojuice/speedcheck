@@ -1,0 +1,77 @@
+name: Wrong prediction
+description: The test predicted one speed and your machine did another.
+title: "[wrong] "
+labels: ["wrong prediction"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A prediction that is reproducibly wrong is the fastest route to a better formula. Thank
+        you for taking the time.
+
+        The prediction is `tok/s = k x bandwidth / bytes per token`, with `k` assumed to be 0.8
+        until a real generation run measures it. If your measured rate is far off, either `k` is
+        wrong for your chip, the bandwidth figure is wrong, or the model size we use is wrong.
+        Your numbers tell us which.
+
+  - type: input
+    id: predicted
+    attributes:
+      label: What was predicted
+      placeholder: "~18 tok/s on Qwen3 1.7B"
+    validations:
+      required: true
+
+  - type: input
+    id: measured
+    attributes:
+      label: What you actually measured
+      placeholder: "11.4 tok/s"
+    validations:
+      required: true
+
+  - type: textarea
+    id: how
+    attributes:
+      label: How you measured it
+      description: |
+        The exact command, and the raw output if you have it. For example
+        `ollama run qwen3:1.7b --verbose` and the `eval rate` line, or a `llama-bench` invocation.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      placeholder: MacBook Air M2, 16 GB
+    validations:
+      required: true
+
+  - type: dropdown
+    id: power
+    attributes:
+      label: Power, during the measurement
+      options:
+        - Plugged in
+        - On battery
+        - Desktop, mains only
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Test output
+      description: Paste what the speed check or browser test reported, so both numbers can be compared.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Worth ruling out first
+      options:
+        - label: The model actually fitted in free memory and did not spill to disk
+        - label: Thinking mode was off, if the model has one
+        - label: The machine was not thermally throttled from a previous run

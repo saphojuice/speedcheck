@@ -1,5 +1,9 @@
 # Why SAPHOJUICE Speedtest?
 
+[![release](https://github.com/saphojuice/speedcheck/actions/workflows/release.yml/badge.svg)](https://github.com/saphojuice/speedcheck/actions/workflows/release.yml)
+[![latest release](https://img.shields.io/github/v/release/saphojuice/speedcheck?sort=semver)](https://github.com/saphojuice/speedcheck/releases/latest)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 I had a spare ThinkPad X13s sitting around. Snapdragon, 16 GB. It's been a workhorse.
 
 I wanted to run a local AI model on it, or at least figure out what it could actually run before downloading a bunch of multi-gigabyte models.
@@ -40,12 +44,21 @@ Free memory, not installed memory. That distinction is most of the story on Wind
 
 ### Measured on a ThinkPad X13s Gen 1
 
+Measured 21 September 2026 with v0.1.1, plugged in, power mode Best performance, warm
+best-of-three. Five consecutive runs agreed to within 2%.
+
 | Quantity | Measured |
 |---|---|
-| Memory bandwidth, single thread | 33 GB/s |
-| Memory bandwidth, 8 threads | 26.7 GB/s |
-| k | 0.83 |
-| Free memory under Windows | 6.4 GB of 16.5 GB |
+| Memory bandwidth, single thread | 34.6 GB/s |
+| Memory bandwidth, 4 threads | 27.5 GB/s |
+| Memory bandwidth, 8 threads | 25.7 GB/s |
+| f32 compute | 70.7 GFLOP/s |
+| k, from a real Ollama run | 0.83 |
+| Free memory under Windows | 3.4 GB of 15.4 GB reported |
+
+More threads do not help once the workload is waiting on memory: on this chip a single thread is
+the fastest configuration. The browser tier measures 23 GB/s on the same machine, because a
+WebAssembly `memory.copy` does not reach what a native STREAM triad does on one core.
 
 | Model | Predicted | Measured |
 |---|---|---|
@@ -59,9 +72,45 @@ Bandwidth peaks single threaded and drops at 8 threads. More threads do not help
 
 **Browser estimate** (`browser/fit.js`). Runs in a page, no install. Measures what the web platform exposes, using a WebAssembly threads kernel for bandwidth, then applies the same two equations. It carries a ±10% band and is labelled an estimate. A browser cannot reach the bandwidth a native program can, so it reads low more often than high, which makes a verdict that a model fits the conservative one.
 
-**Native measurement** (`speedcheck/`). A Rust binary, no external crates. Measures memory bandwidth per working-set tier, f32 GEMM and int8 dot-product throughput, the sustained throttle curve, storage, and the CPU/ISA inventory. Then it downloads a pinned reference model, verifies its SHA-256, generates real tokens against it, and derives `k` from that run instead of guessing. Output is a human summary plus `sj_receipt.json`. Nothing is uploaded unless you answer yes to a prompt.
+**Native measurement** (`speedcheck/`). A Rust binary with one direct dependency, [`ureq`](https://crates.io/crates/ureq) for HTTPS (rustls on macOS and Linux, SChannel on Windows); everything else is the standard library. It measures memory bandwidth per working-set tier and per thread count, f32 GEMM and int8 dot-product throughput, the sustained throttle curve, storage, and the CPU and instruction-set inventory, then records the conditions it ran under.
+
+**In v0.1.x it does not run a model.** No inference engine is bundled, so tok/s is *predicted* from `k x bandwidth / bytes per token` with `k` assumed to be **0.8**. A measured `k` needs a real generation run, which is the largest planned change and the thing [CONTRIBUTING.md](CONTRIBUTING.md) most asks for help with. The output labels every number as measured or predicted.
+
+Nothing is written to disk unless you pass `--out`. Sharing is **on by default**: it asks, and a bare Enter shares. Decline with `n`, or skip the question entirely with `--no-share`. `--show-payload` prints the exact JSON that would be sent, before it asks.
 
 See `speedcheck/README.md` for build and usage. The receipt table shape is `docs/receipt-schema.sql`.
+
+## Verifying what you downloaded
+
+The one-liner does the hash check for you, and refuses to run anything that fails it. If you would
+rather do it by hand, there are three independent checks, in increasing order of strength.
+
+**1. The hash.** Every release publishes `SHA256SUMS`, and the same list appears in the release
+body so you can read it without downloading anything.
+
+```
+curl -fsSLO https://github.com/saphojuice/speedcheck/releases/download/v0.1.1/sj-probe-macos-arm64
+curl -fsSL  https://github.com/saphojuice/speedcheck/releases/download/v0.1.1/SHA256SUMS | shasum -a 256 -c --ignore-missing
+```
+
+**2. The build provenance.** The stronger check: it proves the binary was produced by this
+repository's CI, from a specific commit, and not by anyone else. A matching hash only proves the
+file matches a list; the attestation proves where the list came from.
+
+```
+gh attestation verify sj-probe-macos-arm64 --repo saphojuice/speedcheck
+```
+
+**3. Build it yourself.** CI pins Rust 1.98.0 and builds with `--locked`, so the same source and
+the same toolchain produce the same result.
+
+```
+git clone https://github.com/saphojuice/speedcheck
+cd speedcheck/speedcheck
+cargo build --release --locked
+```
+
+An SPDX SBOM is attached to each release alongside the binaries.
 
 ## What is proven and what is not
 
@@ -93,3 +142,5 @@ SAPHOJUICE is open source. If you have a better way to benchmark local AI perfor
 ## License
 
 MIT. See `LICENSE`.
+
+The SAPHOJUICE name and logo are not covered by this license.

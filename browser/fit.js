@@ -121,15 +121,27 @@
   async function cpuBandwidth(ms){
     const threads = Math.max(1, Math.min(16, navigator.hardwareConcurrency || 4));
     const counts = [...new Set([1, Math.ceil(threads / 2), threads])];
-    // try wasm at the smallest thread count first; if it isn't available at all, don't bother retrying per count
-    let source = 'wasm_threads', bw = 0, bwBy = {};
-    const probe = await wasmBandwidth(counts[0], Math.min(300, ms));
-    if (probe === null) {
-      source = 'js_floor';
-      for (const c of counts) { const g = await jsFloorBandwidth(c, ms); bwBy[c] = g; if (g > bw) bw = g; }
-    } else {
-      bwBy[counts[0]] = probe; bw = probe;
-      for (const c of counts.slice(1)) { const g = await wasmBandwidth(c, ms); if (g !== null) { bwBy[c] = g; if (g > bw) bw = g; } }
+    // A short probe first, used only to find out whether the wasm path is available at all.
+    // Its timing is thrown away: it is too short, and it runs coldest.
+    let source = 'wasm_threads';
+    const probe = await wasmBandwidth(counts[0], Math.min(200, ms));
+    if (probe === null) source = 'js_floor';
+    const measure = probe === null ? jsFloorBandwidth : wasmBandwidth;
+
+    // Warm-up pass then best of two, per thread count. This is the same correction the native
+    // probe makes, and for the same reason: the first pass runs before the CPU has boosted and
+    // while the pages are still cold, so it reads about a third low. Measured on one machine,
+    // single-thread went from 16.0 to match the native 34 once the cold pass stopped counting.
+    // Best is the right statistic for a ceiling: interference only ever pushes it down.
+    let bw = 0; const bwBy = {};
+    for (const c of counts) {
+      await measure(c, 120);                       // discarded
+      let best = 0;
+      for (let i = 0; i < 2; i++) {
+        const g = await measure(c, ms);
+        if (typeof g === 'number' && g > best) best = g;
+      }
+      if (best > 0) { bwBy[c] = best; if (best > bw) bw = best; }
     }
     return { bw, bwBy, source, threads };
   }
